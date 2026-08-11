@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Trade Journal Generator</title>
+    <style>
+      body { font-family: Arial, sans-serif; max-width: 760px; margin: 48px auto; padding: 16px; }
+      h1 { margin-bottom: 0.25rem; }
+      .card { border: 1px solid #ddd; border-radius: 12px; padding: 24px; box-shadow: 0 6px 18px rgba(0,0,0,0.06); }
+      .field { margin-bottom: 18px; }
+      label { display: block; font-weight: 600; margin-bottom: 6px; }
+      input[type=file] { width: 100%; }
+      .button-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+      button { background: #0066cc; border: none; color: white; padding: 12px 18px; border-radius: 8px; cursor: pointer; font-size: 1rem; }
+      button:hover { background: #0055aa; }
+      .note { color: #555; font-size: 0.95rem; margin-top: 12px; }
+      .flash { background: #ffe8e8; border: 1px solid #f2c6c6; border-radius: 8px; padding: 14px; margin-bottom: 18px; color: #8a1f1f; }
+      .preview-box { margin-top: 24px; border-top: 1px solid #ddd; padding-top: 18px; }
+      .preview-box h2 { margin-top: 0; }
+      table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+      th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+      th { background: #f6f6f6; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Trade Journal Generator</h1>
+      <p class="note">Upload one or more screenshot images. The app will extract trade details and create an Excel file.</p>
+
+      {% with messages = get_flashed_messages() %}
+      {% if messages %}
+      <div class="flash">{{ messages[0] }}</div>
+      {% endif %}
+      {% endwith %}
+
+      <form id="upload-form" action="/upload" method="post" enctype="multipart/form-data">
+        <div class="field">
+          <label for="files">Screenshots</label>
+          <input type="file" name="files" id="files" accept="image/*" multiple required />
+        </div>
+        <div class="button-row">
+          <button type="button" id="preview-btn">Preview Trades</button>
+          <button type="submit" id="download-btn">Download ZIP</button>
+        </div>
+      </form>
+      <p class="note">Excel columns: Entry, Stop Loss, Take Profit, Break Even. The download is generated dynamically and no file is stored on the server.</p>
+      <div id="preview-result" class="preview-box" hidden>
+        <h2>Preview</h2>
+        <div id="preview-summary"></div>
+        <div id="preview-table"></div>
+      </div>
+    </div>
+    <script>
+      const form = document.getElementById('upload-form');
+      const fileInput = document.getElementById('files');
+      const previewButton = document.getElementById('preview-btn');
+      const previewResult = document.getElementById('preview-result');
+      const previewSummary = document.getElementById('preview-summary');
+      const previewTable = document.getElementById('preview-table');
+
+      previewButton.addEventListener('click', async () => {
+        if (!fileInput.files.length) {
+          alert('Please select at least one screenshot to preview.');
+          return;
+        }
+
+        const formData = new FormData();
+        for (const file of fileInput.files) {
+          formData.append('files', file);
+        }
+
+        previewButton.disabled = true;
+        previewButton.textContent = 'Loading preview...';
+
+        try {
+          const response = await fetch('/parse', {
+            method: 'POST',
+            body: formData,
+          });
+          const data = await response.json();
+          if (!data.success) {
+            throw new Error(data.error || 'Unable to parse files.');
+          }
+
+          previewSummary.innerHTML = `<strong>Summary:</strong><br>${Object.entries(data.summary)
+            .map(([key, value]) => `${key}: ${value}`)
+            .join('<br>')}`;
+
+          const rows = data.trades
+            .map(
+              (trade) =>
+                `<tr><td>${trade.entry || ''}</td><td>${trade.stop_loss || ''}</td><td>${trade.take_profit || ''}</td><td>${trade.break_even || ''}</td></tr>`
+            )
+            .join('');
+          previewTable.innerHTML = `
+            <table>
+              <thead>
+                <tr><th>Entry</th><th>Stop Loss</th><th>Take Profit</th><th>Break Even</th></tr>
+              </thead>
+              <tbody>${rows}</tbody>
+            </table>
+          `;
+          previewResult.hidden = false;
+        } catch (error) {
+          alert(error.message);
+          previewResult.hidden = true;
+        } finally {
+          previewButton.disabled = false;
+          previewButton.textContent = 'Preview Trades';
+        }
+      });
+
+      form.addEventListener('submit', () => {
+        setTimeout(() => {
+          fileInput.value = '';
+          previewResult.hidden = true;
+        }, 1000);
+      });
+    </script>
+  </body>
+</html>
