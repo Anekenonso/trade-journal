@@ -39,6 +39,12 @@ def allowed_file(filename):
 
 
 def ocr_image(image: Image.Image) -> str:
+    # Downscale very large screenshots before OCR to keep memory usage
+    # in check on low-RAM hosts. Tesseract doesn't need full resolution.
+    max_dimension = 2000
+    if max(image.size) > max_dimension:
+        image.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
+
     try:
         return pytesseract.image_to_string(image, lang="eng")
     except TesseractNotFoundError as exc:
