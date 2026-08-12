@@ -28,10 +28,17 @@ app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-me")
 
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "tiff"}
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+# Optional: point at an OpenAI-compatible gateway (e.g. AgentRouter) instead
+# of OpenAI directly. Leave unset to use OpenAI's default endpoint.
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL") or None
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 openai_client = None
 if OPENAI_API_KEY and openai:
-    openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+    client_kwargs = {"api_key": OPENAI_API_KEY}
+    if OPENAI_BASE_URL:
+        client_kwargs["base_url"] = OPENAI_BASE_URL
+    openai_client = openai.OpenAI(**client_kwargs)
 
 
 def allowed_file(filename):
@@ -227,7 +234,7 @@ def parse_text_to_trades(text: str) -> list[dict]:
 
         try:
             response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=OPENAI_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
                 max_tokens=600,
