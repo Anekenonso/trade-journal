@@ -238,14 +238,21 @@ def parse_text_to_trades(text: str) -> list[dict]:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
                 max_tokens=600,
+                stream=False,
             )
+            if isinstance(response, str):
+                raise ValueError(f"API returned a raw string instead of a response object: {response[:300]!r}")
             content = response.choices[0].message.content.strip()
             cleaned = content
             if cleaned.startswith("```json") and cleaned.endswith("```"):
                 cleaned = cleaned[7:-3].strip()
             return json.loads(cleaned)
         except Exception as exc:
-            app.logger.warning("OpenAI parsing failed, falling back to heuristics: %s", exc)
+            app.logger.warning(
+                "OpenAI parsing failed, falling back to heuristics: %s | response_type=%s",
+                exc,
+                type(locals().get("response")).__name__,
+            )
 
     return parse_ocr_text_simple(text)
 
