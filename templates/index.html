@@ -18,9 +18,10 @@
       .flash { background: #ffe8e8; border: 1px solid #f2c6c6; border-radius: 8px; padding: 14px; margin-bottom: 18px; color: #8a1f1f; }
       .preview-box { margin-top: 24px; border-top: 1px solid #ddd; padding-top: 18px; }
       .preview-box h2 { margin-top: 0; }
-      table { width: 100%; border-collapse: collapse; margin-top: 12px; }
-      th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+      table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.82rem; }
+      th, td { border: 1px solid #ddd; padding: 6px; text-align: left; white-space: nowrap; }
       th { background: #f6f6f6; }
+      .preview-box { overflow-x: auto; }
     </style>
   </head>
   <body>
@@ -90,13 +91,13 @@
           const rows = data.trades
             .map(
               (trade) =>
-                `<tr><td>${trade.entry || ''}</td><td>${trade.stop_loss || ''}</td><td>${trade.take_profit || ''}</td><td>${trade.break_even || ''}</td></tr>`
+                `<tr><td>${trade.symbol || ''}</td><td>${trade.direction || ''}</td><td>${trade.lot_size || ''}</td><td>${trade.entry || ''}</td><td>${trade.exit_price || ''}</td><td>${trade.stop_loss || ''}</td><td>${trade.take_profit || ''}</td><td>${trade.outcome || ''}</td><td>${trade.session || ''}</td><td>${trade.profit || ''}</td></tr>`
             )
             .join('');
           previewTable.innerHTML = `
             <table>
               <thead>
-                <tr><th>Entry</th><th>Stop Loss</th><th>Take Profit</th><th>Break Even</th></tr>
+                <tr><th>Symbol</th><th>Dir</th><th>Lots</th><th>Entry</th><th>Exit</th><th>S/L</th><th>T/P</th><th>Outcome</th><th>Session</th><th>Profit</th></tr>
               </thead>
               <tbody>${rows}</tbody>
             </table>

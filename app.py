@@ -46,7 +46,7 @@ def ocr_image(image: Image.Image) -> str:
         image.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
 
     try:
-        return pytesseract.image_to_string(image, lang="eng")
+        return pytesseract.image_to_string(image, lang="eng", config="--psm 6")
     except TesseractNotFoundError as exc:
         raise RuntimeError(
             "Tesseract OCR executable not found. Please install Tesseract and add it to your PATH. "
@@ -54,37 +54,174 @@ def ocr_image(image: Image.Image) -> str:
         ) from exc
 
 
+SYMBOL_LINE_RE = re.compile(
+    r'\b([A-Z]{2,10}(?:\.[A-Za-z]+)?)\s*,\s*(buy|sell)\s+([\d]*\.?[\d]+)',
+    re.IGNORECASE,
+)
+
+PRICE_ARROW_PROFIT_RE = re.compile(
+    r'([\d]+\.\d+)\s*(?:\u2192|\u2014|\u2013|->|-{1,2}>|>|~)\s*([\d]+\.\d+)[^\d+\-\n]{0,40}([+-]?\d+\.\d{1,2})?'
+)
+
+# Fallback for when OCR drops the arrow character entirely, leaving two
+# bare decimal numbers (optionally followed by a signed profit figure).
+PRICE_PAIR_FALLBACK_RE = re.compile(
+    r'^\s*([\d]+\.\d+)\s+([\d]+\.\d+)\s*([+-]?\d+\.\d{1,2})?\s*$',
+    re.MULTILINE,
+)
+
+SL_RE = re.compile(r'S\s*/\s*L\s*:?\s*([\d]+\.\d+)', re.IGNORECASE)
+TP_RE = re.compile(r'T\s*/\s*P\s*:?\s*([\d]+\.\d+)', re.IGNORECASE)
+DATETIME_RE = re.compile(r'(\d{4}[./]\d{2}[./]\d{2})\s+(\d{1,2}:\d{2}(?::\d{2})?)')
+
+# Session windows keyed to the hour shown on the screenshot (broker/server
+# time as displayed by the platform, not necessarily GMT).
+SESSION_WINDOWS = [
+    (0, 7, "Asian/Sydney"),
+    (7, 12, "London"),
+    (12, 16, "London/New York Overlap"),
+    (16, 21, "New York"),
+    (21, 24, "Asian/Sydney"),
+]
+
+
+def get_trading_session(time_str: str) -> str:
+    if not time_str:
+        return ""
+    try:
+        hour = int(time_str.split(":")[0])
+    except (ValueError, IndexError):
+        return ""
+    for start, end, name in SESSION_WINDOWS:
+        if start <= hour < end:
+            return name
+    return ""
+
+
+def determine_outcome(entry, exit_price, sl, tp, profit=None) -> str:
+    if entry is None or exit_price is None:
+        return ""
+
+    candidates = {"Break Even": abs(exit_price - entry)}
+    if sl is not None:
+        candidates["Stop Loss"] = abs(exit_price - sl)
+    if tp is not None:
+        candidates["Take Profit"] = abs(exit_price - tp)
+
+    label = min(candidates, key=candidates.get)
+    nearest_distance = candidates[label]
+
+    if label != "Break Even":
+        reference_price = sl if label == "Stop Loss" else tp
+        reference_distance = abs(entry - reference_price)
+        if reference_distance != 0 and nearest_distance > reference_distance * 0.5:
+            label = "Manual/Other"
+
+    # Sanity check against the realized profit: a genuine stop-loss hit
+    # shouldn't show a profit, and a genuine take-profit hit shouldn't show
+    # a loss. If it does, the price landed near that level for another
+    # reason (trailing stop, manual close), so don't mislabel it.
+    if profit is not None:
+        if label == "Stop Loss" and profit > 0:
+            label = "Manual/Other"
+        elif label == "Take Profit" and profit < 0:
+            label = "Manual/Other"
+
+    return label
+
+
+def split_trade_blocks(text: str) -> list[str]:
+    matches = list(SYMBOL_LINE_RE.finditer(text))
+    blocks = []
+    for i, match in enumerate(matches):
+        start = match.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        blocks.append(text[start:end])
+    return blocks
+
+
 def parse_ocr_text_simple(text: str) -> list[dict]:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    """Parse MT4/MT5 trade history screenshot text into structured rows.
+
+    Targets blocks shaped like:
+        EURUSD, buy 0.25                    2026.08.10 11:13:43
+        1.15592 -> 1.15508                  -21.00
+        #33890516            Open:          2026.08.10 07:54:38
+        S/L:      1.15511    Swap:          0.00
+        T/P:      1.15837    Commission:    -1.00
+    """
     entries = []
-    current = {"entry": "", "stop_loss": "", "take_profit": "", "break_even": ""}
+    blocks = split_trade_blocks(text)
 
-    for line in lines:
-        low = line.lower()
-        if "entry" in low:
-            current["entry"] = line.split(":", 1)[-1].strip() if ":" in line else line
-        elif "stop" in low and "loss" in low:
-            current["stop_loss"] = line.split(":", 1)[-1].strip() if ":" in line else line
-        elif "take" in low and "profit" in low:
-            current["take_profit"] = line.split(":", 1)[-1].strip() if ":" in line else line
-        elif "break even" in low or "breakeven" in low:
-            if "yes" in low or "true" in low or "hit" in low or "stopped" in low:
-                current["break_even"] = "Yes"
-            else:
-                current["break_even"] = line.split(":", 1)[-1].strip() if ":" in line else "Yes"
+    for block in blocks:
+        symbol_match = SYMBOL_LINE_RE.search(block)
+        if not symbol_match:
+            continue
 
-    if any(current.values()):
-        entries.append(current)
+        symbol = symbol_match.group(1).upper()
+        direction = symbol_match.group(2).capitalize()
+        lot_size = symbol_match.group(3)
+
+        price_match = PRICE_ARROW_PROFIT_RE.search(block)
+        if not price_match:
+            price_match = PRICE_PAIR_FALLBACK_RE.search(block)
+
+        entry_str = price_match.group(1) if price_match else ""
+        exit_str = price_match.group(2) if price_match else ""
+        profit = price_match.group(3) if price_match and price_match.group(3) else ""
+
+        entry_price = parse_price(entry_str)
+        exit_price = parse_price(exit_str)
+
+        sl_match = SL_RE.search(block)
+        tp_match = TP_RE.search(block)
+        sl_price = parse_price(sl_match.group(1)) if sl_match else None
+        tp_price = parse_price(tp_match.group(1)) if tp_match else None
+
+        datetimes = DATETIME_RE.findall(block)
+        close_date, close_time = datetimes[0] if len(datetimes) > 0 else ("", "")
+        open_date, open_time = datetimes[1] if len(datetimes) > 1 else ("", "")
+
+        outcome = determine_outcome(entry_price, exit_price, sl_price, tp_price, parse_price(profit))
+        session = get_trading_session(open_time)
+
+        entries.append(
+            {
+                "symbol": symbol,
+                "direction": direction,
+                "lot_size": lot_size,
+                "entry": entry_str,
+                "exit_price": exit_str,
+                "stop_loss": sl_match.group(1) if sl_match else "",
+                "take_profit": tp_match.group(1) if tp_match else "",
+                "outcome": outcome,
+                "session": session,
+                "open_date": open_date,
+                "open_time": open_time,
+                "close_date": close_date,
+                "close_time": close_time,
+                "profit": profit,
+            }
+        )
+
     return entries
 
 
 def parse_text_to_trades(text: str) -> list[dict]:
     if openai_client:
         prompt = (
-            "Extract structured trading journal entries from the following screenshot text. "
-            "Return a JSON array of objects with exactly these fields: entry, stop_loss, take_profit, break_even. "
-            "If the trade was stopped out by break even, set break_even to 'Yes'. Otherwise set 'No' or leave blank. "
-            "If a field is missing, return an empty string. Do not include any extra keys. "
+            "Extract structured trading journal entries from this MT4/MT5 trade history "
+            "screenshot text. Return a JSON array of objects with exactly these fields: "
+            "symbol, direction (Buy or Sell), lot_size, entry, exit_price, stop_loss, "
+            "take_profit, outcome, session, open_date, open_time, close_date, close_time, profit. "
+            "For outcome, compare the exit price to stop_loss and take_profit: if exit is at or "
+            "near take_profit, use 'Take Profit'; if at or near stop_loss, use 'Stop Loss'; if at "
+            "or near the entry price (trader likely moved stop loss to break even), use "
+            "'Break Even'; otherwise use 'Manual/Other'. "
+            "For session, use the open_time hour against these broker-time windows: "
+            "00:00-07:00 Asian/Sydney, 07:00-12:00 London, 12:00-16:00 London/New York Overlap, "
+            "16:00-21:00 New York, 21:00-24:00 Asian/Sydney. "
+            "If a field is missing from the text, return an empty string. Do not include any extra keys. "
             f"Text:\n{text.strip()}"
         )
 
@@ -140,61 +277,73 @@ def summarize_trades(trade_rows: list[dict]) -> dict:
     total = len(trade_rows)
     wins = 0
     losses = 0
-    break_evens = 0
-    win_values = []
-    loss_values = []
+    profits = []
+
+    outcome_counts = {"Take Profit": 0, "Stop Loss": 0, "Break Even": 0, "Manual/Other": 0}
+    session_counts = {}
 
     for trade in trade_rows:
-        be_flag = str(trade.get("break_even", "")).strip().lower()
-        if be_flag == "yes":
-            break_evens += 1
-            continue
+        profit_val = parse_price(trade.get("profit", ""))
+        if profit_val is not None:
+            profits.append(profit_val)
+            if profit_val > 0:
+                wins += 1
+            elif profit_val < 0:
+                losses += 1
 
-        if trade.get("take_profit"):
-            wins += 1
-        if trade.get("stop_loss"):
-            losses += 1
+        outcome = trade.get("outcome", "")
+        if outcome in outcome_counts:
+            outcome_counts[outcome] += 1
 
-        entry_price = parse_price(trade.get("entry", ""))
-        take_price = parse_price(trade.get("take_profit", ""))
-        stop_price = parse_price(trade.get("stop_loss", ""))
+        session = trade.get("session", "")
+        if session:
+            session_counts[session] = session_counts.get(session, 0) + 1
 
-        if entry_price is not None and take_price is not None:
-            win_values.append(abs(take_price - entry_price))
-        if entry_price is not None and stop_price is not None:
-            loss_values.append(abs(entry_price - stop_price))
+    decided = wins + losses
+    win_values = [p for p in profits if p > 0]
+    loss_values = [p for p in profits if p < 0]
 
     summary = {
         "Total Trades": total,
-        "Win Rate (%)": round((wins / total * 100), 2) if total else 0,
+        "Win Rate (%)": round((wins / decided * 100), 2) if decided else 0,
         "Wins": wins,
         "Losses": losses,
-        "Break Even": break_evens,
-        "Average Win": round(mean(win_values), 4) if win_values else "",
-        "Average Loss": round(mean(loss_values), 4) if loss_values else "",
+        "Take Profit Hits": outcome_counts["Take Profit"],
+        "Stop Loss Hits": outcome_counts["Stop Loss"],
+        "Break Even Exits": outcome_counts["Break Even"],
+        "Manual/Other Exits": outcome_counts["Manual/Other"],
+        "Net Profit": round(sum(profits), 2) if profits else 0,
+        "Average Win": round(mean(win_values), 2) if win_values else "",
+        "Average Loss": round(mean(loss_values), 2) if loss_values else "",
+        "Session Breakdown": session_counts,
     }
     return summary
 
 
-def build_raw_excel_bytes(trade_rows: list[dict]) -> io.BytesIO:
-    clean_rows = [
-        {
-            "entry": trade.get("entry", ""),
-            "stop_loss": trade.get("stop_loss", ""),
-            "take_profit": trade.get("take_profit", ""),
-            "break_even": trade.get("break_even", ""),
-        }
-        for trade in trade_rows
-    ]
+TRADE_COLUMNS = [
+    "symbol", "direction", "lot_size", "entry", "exit_price",
+    "stop_loss", "take_profit", "outcome", "session",
+    "open_date", "open_time", "close_date", "close_time", "profit",
+]
+TRADE_HEADER_LABELS = [
+    "Symbol", "Direction", "Lot Size", "Entry", "Exit Price",
+    "Stop Loss", "Take Profit", "Outcome", "Session",
+    "Open Date", "Open Time", "Close Date", "Close Time", "Profit",
+]
 
+
+def _trades_to_dataframe(trade_rows: list[dict]) -> pd.DataFrame:
+    clean_rows = [{col: trade.get(col, "") for col in TRADE_COLUMNS} for trade in trade_rows]
     df = pd.DataFrame(clean_rows)
     if df.empty:
-        df = pd.DataFrame(
-            [{"entry": "", "stop_loss": "", "take_profit": "", "break_even": ""}]
-        )
+        df = pd.DataFrame([{col: "" for col in TRADE_COLUMNS}])
+    df = df[TRADE_COLUMNS]
+    df.columns = TRADE_HEADER_LABELS
+    return df
 
-    df = df[["entry", "stop_loss", "take_profit", "break_even"]]
-    df.columns = ["Entry", "Stop Loss", "Take Profit", "Break Even"]
+
+def build_raw_excel_bytes(trade_rows: list[dict]) -> io.BytesIO:
+    df = _trades_to_dataframe(trade_rows)
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -204,45 +353,37 @@ def build_raw_excel_bytes(trade_rows: list[dict]) -> io.BytesIO:
 
 
 def build_summary_excel_bytes(trade_rows: list[dict]) -> io.BytesIO:
-    clean_rows = [
-        {
-            "entry": trade.get("entry", ""),
-            "stop_loss": trade.get("stop_loss", ""),
-            "take_profit": trade.get("take_profit", ""),
-            "break_even": trade.get("break_even", ""),
-        }
-        for trade in trade_rows
-    ]
+    summary = summarize_trades(trade_rows)
+    session_breakdown = summary.pop("Session Breakdown", {})
 
-    summary = summarize_trades(clean_rows)
-    summary_rows = [
-        ["Total Trades", summary["Total Trades"]],
-        ["Win Rate (%)", summary["Win Rate (%)"]],
-        ["Wins", summary["Wins"]],
-        ["Losses", summary["Losses"]],
-        ["Break Even", summary["Break Even"]],
-        ["Average Win", summary["Average Win"]],
-        ["Average Loss", summary["Average Loss"]],
-    ]
+    summary_rows = [[key, value] for key, value in summary.items()]
     summary_df = pd.DataFrame(summary_rows, columns=["Metric", "Value"])
-    trades_df = pd.DataFrame(clean_rows)
-    trades_df = trades_df[["entry", "stop_loss", "take_profit", "break_even"]]
-    trades_df.columns = ["Entry", "Stop Loss", "Take Profit", "Break Even"]
+
+    session_rows = [[session, count] for session, count in session_breakdown.items()]
+    session_df = pd.DataFrame(session_rows, columns=["Session", "Trade Count"]) if session_rows else pd.DataFrame(
+        columns=["Session", "Trade Count"]
+    )
+
+    trades_df = _trades_to_dataframe(trade_rows)
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         summary_df.to_excel(writer, index=False, sheet_name="Summary")
+        session_startrow = len(summary_df) + 2
+        session_df.to_excel(writer, index=False, sheet_name="Summary", startrow=session_startrow)
         trades_df.to_excel(writer, index=False, sheet_name="Trades")
 
         summary_ws = writer.sheets["Summary"]
         chart = BarChart()
         chart.type = "col"
-        chart.title = "Trade Outcome Counts"
+        chart.title = "Exit Outcome Counts"
         chart.y_axis.title = "Count"
         chart.x_axis.title = "Outcome"
 
-        cats = Reference(summary_ws, min_col=1, min_row=3, max_row=5)
-        vals = Reference(summary_ws, min_col=2, min_row=3, max_row=5)
+        # Rows 6-9 hold Take Profit Hits, Stop Loss Hits, Break Even Exits,
+        # Manual/Other Exits (row 1 is the header, row 2 is Total Trades, etc.)
+        cats = Reference(summary_ws, min_col=1, min_row=6, max_row=9)
+        vals = Reference(summary_ws, min_col=2, min_row=6, max_row=9)
         chart.add_data(vals, titles_from_data=False)
         chart.set_categories(cats)
         summary_ws.add_chart(chart, "D2")
